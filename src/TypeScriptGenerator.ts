@@ -5,20 +5,21 @@ import {
   LinkedField,
   Root,
   ScalarField,
+  Schema,
   SchemaUtils,
-  TypeGenerator
+  TypeGenerator,
+  TypeID
 } from "relay-compiler";
 import { ConnectionField } from "relay-compiler/lib/core/GraphQLIR";
 import { TypeGeneratorOptions } from "relay-compiler/lib/language/RelayLanguagePluginInterface";
 
 import * as ConnectionFieldTransform from "relay-compiler/lib/transforms/ConnectionFieldTransform";
 import * as FlattenTransform from "relay-compiler/lib/transforms/FlattenTransform";
-import * as RelayMaskTransform from "relay-compiler/lib/transforms/RelayMaskTransform";
-import * as RelayMatchTransform from "relay-compiler/lib/transforms/RelayMatchTransform";
-import * as RelayRefetchableFragmentTransform from "relay-compiler/lib/transforms/RelayRefetchableFragmentTransform";
-import * as RelayRelayDirectiveTransform from "relay-compiler/lib/transforms/RelayRelayDirectiveTransform";
+import * as MaskTransform from "relay-compiler/lib/transforms/MaskTransform";
+import * as MatchTransform from "relay-compiler/lib/transforms/MatchTransform";
+import * as RefetchableFragmentTransform from "relay-compiler/lib/transforms/RefetchableFragmentTransform";
+import * as RelayDirectiveTransform from "relay-compiler/lib/transforms/RelayDirectiveTransform";
 
-import { GraphQLNonNull, GraphQLString } from "graphql";
 import * as ts from "typescript";
 import {
   State,
@@ -35,8 +36,11 @@ const FRAGMENT_REFS_TYPE_NAME = "FragmentRefs";
 const MODULE_IMPORT_FIELD = "MODULE_IMPORT_FIELD";
 const DIRECTIVE_NAME = "raw_response_type";
 
-export const generate: TypeGenerator["generate"] = (node, options) => {
-  const ast: ts.Statement[] = IRVisitor.visit(node, createVisitor(options));
+export const generate: TypeGenerator["generate"] = (schema, node, options) => {
+  const ast: ts.Statement[] = IRVisitor.visit(
+    node,
+    createVisitor(schema, options)
+  );
   const printer = ts.createPrinter({
     newLine: ts.NewLineKind.LineFeed
   });
@@ -55,7 +59,7 @@ type Selection = {
   key: string;
   schemaName?: string;
   value?: any;
-  nodeType?: any;
+  nodeType?: TypeID | "MODULE_IMPORT_FIELD";
   conditional?: boolean;
   concreteType?: string;
   ref?: string;
@@ -71,6 +75,7 @@ function nullthrows<T>(obj: T | null | undefined): T {
 }
 
 function makeProp(
+  schema: Schema,
   selection: Selection,
   state: State,
   unmasked: boolean,
@@ -78,11 +83,13 @@ function makeProp(
 ): ts.PropertySignature {
   let { value } = selection;
   const { key, schemaName, conditional, nodeType, nodeSelections } = selection;
-  if (nodeType) {
+  if (nodeType && nodeType !== "MODULE_IMPORT_FIELD") {
     value = transformScalarType(
+      schema,
       nodeType,
       state,
       selectionsToAST(
+        schema,
         [Array.from(nullthrows(nodeSelections).values())],
         state,
         unmasked
@@ -103,6 +110,7 @@ const onlySelectsTypename = (selections: Selection[]) =>
   selections.every(isTypenameSelection);
 
 function selectionsToAST(
+  schema: Schema,
   selections: ReadonlyArray<ReadonlyArray<Selection>>,
   state: State,
   unmasked: boolean,
@@ -146,7 +154,7 @@ function selectionsToAST(
           if (selection.schemaName === "__typename") {
             typenameAliases.add(selection.key);
           }
-          return makeProp(selection, state, unmasked, concreteType);
+          return makeProp(schema, selection, state, unmasked, concreteType);
         })
       );
     }
@@ -187,6 +195,7 @@ function selectionsToAST(
       sel =>
         isTypenameSelection(sel) && sel.concreteType
           ? makeProp(
+              schema,
               {
                 ...sel,
                 conditional: false
@@ -195,7 +204,7 @@ function selectionsToAST(
               unmasked,
               sel.concreteType
             )
-          : makeProp(sel, state, unmasked)
+          : makeProp(schema, sel, state, unmasked)
     );
     types.push(selectionMapValues);
   }
@@ -321,7 +330,10 @@ function importTypes(names: string[], fromModule: string): ts.Statement {
   );
 }
 
-function createVisitor(options: TypeGeneratorOptions): IRVisitor.NodeVisitor {
+function createVisitor(
+  schema: Schema,
+  options: TypeGeneratorOptions
+): IRVisitor.NodeVisitor {
   const state: State = {
     customScalars: options.customScalars,
     enumsHasteModule: options.enumsHasteModule,
@@ -341,11 +353,16 @@ function createVisitor(options: TypeGeneratorOptions): IRVisitor.NodeVisitor {
   return {
     leave: {
       Root(node) {
-        const inputVariablesType = generateInputVariablesType(node, state);
+        const inputVariablesType = generateInputVariablesType(
+          schema,
+          node,
+          state
+        );
         const inputObjectTypes = generateInputObjectTypes(state);
         const responseType = exportType(
           `${node.name}Response`,
           selectionsToAST(
+            schema,
             /* $FlowFixMe: selections have already been transformed */
             (node.selections as any) as ReadonlyArray<ReadonlyArray<Selection>>,
             state,
@@ -371,12 +388,12 @@ function createVisitor(options: TypeGeneratorOptions): IRVisitor.NodeVisitor {
         ) {
           rawResponseType = IRVisitor.visit(
             normalizationIR,
-            createRawResponseTypeVisitor(state)
+            createRawResponseTypeVisitor(schema, state)
           );
         }
         const nodes = [
           ...getFragmentRefsTypeImport(state),
-          ...getEnumDefinitions(state),
+          ...getEnumDefinitions(schema, state),
           ...inputObjectTypes,
           inputVariablesType,
           responseType
@@ -419,12 +436,12 @@ function createVisitor(options: TypeGeneratorOptions): IRVisitor.NodeVisitor {
           if (
             numConcreteSelections <= 1 &&
             isTypenameSelection(selection) &&
-            !isAbstractType(node.type)
+            !schema.isAbstractType(node.type)
           ) {
             return [
               {
                 ...selection,
-                concreteType: node.type.toString()
+                concreteType: schema.getTypeString(node.type)
               }
             ];
           }
@@ -457,6 +474,7 @@ function createVisitor(options: TypeGeneratorOptions): IRVisitor.NodeVisitor {
 
         const unmasked = node.metadata != null && node.metadata.mask === false;
         const baseType = selectionsToAST(
+          schema,
           selections,
           state,
           unmasked,
@@ -486,26 +504,25 @@ function createVisitor(options: TypeGeneratorOptions): IRVisitor.NodeVisitor {
         ];
       },
       InlineFragment(node) {
-        const typeCondition = node.typeCondition;
         return flattenArray(
           /* $FlowFixMe: selections have already been transformed */
           (node.selections as any) as ReadonlyArray<ReadonlyArray<Selection>>
         ).map(typeSelection => {
-          return isAbstractType(typeCondition)
+          return schema.isAbstractType(node.typeCondition)
             ? {
                 ...typeSelection,
                 conditional: true
               }
             : {
                 ...typeSelection,
-                concreteType: typeCondition.toString()
+                concreteType: schema.getTypeString(node.typeCondition)
               };
         });
       },
       Condition: visitCondition,
       // TODO: Why not inline it like others?
       ScalarField(node) {
-        return visitScalarField(node, state);
+        return visitScalarField(schema, node, state);
       },
       LinkedField: visitLinkedField,
       ConnectionField: visitConnectionField,
@@ -514,12 +531,12 @@ function createVisitor(options: TypeGeneratorOptions): IRVisitor.NodeVisitor {
           {
             key: "__fragmentPropName",
             conditional: true,
-            value: transformScalarType(GraphQLString, state)
+            value: transformScalarType(schema, schema.expectStringType(), state)
           },
           {
             key: "__module_component",
             conditional: true,
-            value: transformScalarType(GraphQLString, state)
+            value: transformScalarType(schema, schema.expectStringType(), state)
           },
           {
             key: "__fragments_" + node.name,
@@ -552,12 +569,12 @@ function visitCondition(node: Condition) {
   });
 }
 
-function visitScalarField(node: ScalarField, state: State) {
+function visitScalarField(schema: Schema, node: ScalarField, state: State) {
   return [
     {
       key: node.alias || node.name,
       schemaName: node.name,
-      value: transformScalarType(node.type, state)
+      value: transformScalarType(schema, node.type, state)
     }
   ];
 }
@@ -605,6 +622,7 @@ function visitConnectionField(node: ConnectionField) {
 }
 
 function makeRawResponseProp(
+  schema: Schema,
   { key, schemaName, value, conditional, nodeType, nodeSelections }: Selection,
   state: State,
   concreteType: string | null
@@ -616,9 +634,11 @@ function makeRawResponseProp(
       throw new Error("TODO!");
     }
     value = transformScalarType(
+      schema,
       nodeType,
       state,
       selectionsToRawResponseBabel(
+        schema,
         [Array.from(nullthrows(nodeSelections).values())],
         state,
         isAbstractType(nodeType) ? null : nodeType.name
@@ -656,6 +676,7 @@ function selectionsToMap(
 
 // Transform the codegen IR selections into TS types
 function selectionsToRawResponseBabel(
+  schema: Schema,
   selections: ReadonlyArray<ReadonlyArray<Selection>>,
   state: State,
   nodeTypeName: string | null
@@ -687,12 +708,13 @@ function selectionsToRawResponseBabel(
         ).map(selection => {
           if (isTypenameSelection(selection)) {
             return makeRawResponseProp(
+              schema,
               { ...selection, conditional: false },
               state,
               concreteType
             );
           }
-          return makeRawResponseProp(selection, state, concreteType);
+          return makeRawResponseProp(schema, selection, state, concreteType);
         })
       );
     }
@@ -702,12 +724,13 @@ function selectionsToRawResponseBabel(
       baseFields.map(selection => {
         if (isTypenameSelection(selection)) {
           return makeRawResponseProp(
+            schema,
             { ...selection, conditional: false },
             state,
             nodeTypeName
           );
         }
-        return makeRawResponseProp(selection, state, null);
+        return makeRawResponseProp(schema, selection, state, null);
       })
     );
   }
@@ -717,13 +740,17 @@ function selectionsToRawResponseBabel(
 }
 
 // Visitor for generating raw response type
-function createRawResponseTypeVisitor(state: State): IRVisitor.NodeVisitor {
+function createRawResponseTypeVisitor(
+  schema: Schema,
+  state: State
+): IRVisitor.NodeVisitor {
   return {
     leave: {
       Root(node) {
         return exportType(
           `${node.name}RawResponse`,
           selectionsToRawResponseBabel(
+            schema,
             /* $FlowFixMe: selections have already been transformed */
             (node.selections as any) as ReadonlyArray<ReadonlyArray<Selection>>,
             state,
@@ -737,17 +764,17 @@ function createRawResponseTypeVisitor(state: State): IRVisitor.NodeVisitor {
           /* $FlowFixMe: selections have already been transformed */
           (node.selections as any) as ReadonlyArray<ReadonlyArray<Selection>>
         ).map(typeSelection => {
-          return isAbstractType(typeCondition)
+          return schema.isAbstractType(typeCondition)
             ? typeSelection
             : {
                 ...typeSelection,
-                concreteType: typeCondition.toString()
+                concreteType: schema.getTypeString(typeCondition)
               };
         });
       },
       Condition: visitCondition,
       ScalarField(node) {
-        return visitScalarField(node, state);
+        return visitScalarField(schema, node, state);
       },
       ConnectionField: visitConnectionField,
       LinkedField: visitLinkedField,
@@ -772,8 +799,8 @@ function createRawResponseTypeVisitor(state: State): IRVisitor.NodeVisitor {
           (node.selections as any) as ReadonlyArray<ReadonlyArray<Selection>>
         );
       },
-      ModuleImport(node) {
-        return visitRawResponseModuleImport(node, state);
+      ModuleImport(node, state) {
+        return visitRawResponseModuleImport(schema, node, state);
       },
       FragmentSpread(_node) {
         throw new Error(
@@ -786,13 +813,18 @@ function createRawResponseTypeVisitor(state: State): IRVisitor.NodeVisitor {
 }
 
 // Dedupe the generated type of module selections to reduce file size
-function visitRawResponseModuleImport(node: any, state: State): Selection[] {
+function visitRawResponseModuleImport(
+  schema: Schema,
+  node: any,
+  state: State
+): Selection[] {
   const { selections, name: key } = node;
   const moduleSelections = selections
     .filter((sel: any) => sel.length && sel[0].schemaName === "js")
     .map((arr: any[]) => arr[0]);
   if (!state.matchFields.has(key)) {
     const ast = selectionsToRawResponseBabel(
+      schema,
       node.selections.filter(
         (sel: any) => sel.length > 1 || sel[0].schemaName !== "js"
       ),
@@ -832,15 +864,15 @@ function generateInputObjectTypes(state: State) {
   });
 }
 
-function generateInputVariablesType(node: Root, state: State) {
+function generateInputVariablesType(schema: Schema, node: Root, state: State) {
   return exportType(
     `${node.name}Variables`,
     exactObjectTypeAnnotation(
       node.argumentDefinitions.map(arg => {
         return objectTypeProperty(
           arg.name,
-          transformInputType(arg.type, state),
-          { readonly: false, optional: !(arg.type instanceof GraphQLNonNull) }
+          transformInputType(schema, arg.type, state),
+          { readonly: false, optional: !schema.isNonNull(arg.type) }
         );
       })
     )
@@ -892,11 +924,10 @@ function getFragmentRefsTypeImport(state: State): ts.Statement[] {
   return [];
 }
 
-function getEnumDefinitions({
-  enumsHasteModule,
-  usedEnums,
-  noFutureProofEnums
-}: State) {
+function getEnumDefinitions(
+  schema: Schema,
+  { enumsHasteModule, usedEnums, noFutureProofEnums }: State
+) {
   const enumNames = Object.keys(usedEnums).sort();
   if (enumNames.length === 0) {
     return [];
@@ -910,7 +941,7 @@ function getEnumDefinitions({
     );
   }
   return enumNames.map(name => {
-    const values = usedEnums[name].getValues().map(({ value }) => value);
+    const values = schema.getEnumValues(usedEnums[name]);
     values.sort();
     if (!noFutureProofEnums) {
       values.push("%future added value");
@@ -918,7 +949,7 @@ function getEnumDefinitions({
     return exportType(
       name,
       ts.createUnionTypeNode(
-        values.map(value => stringLiteralTypeAnnotation(value))
+        values.map((value: any) => stringLiteralTypeAnnotation(value))
       )
     );
   });
@@ -939,10 +970,10 @@ function getDataTypeName(name: string): string {
 // Should match FLOW_TRANSFORMS array
 // https://github.com/facebook/relay/blob/v6.0.0/packages/relay-compiler/language/javascript/RelayFlowGenerator.js#L621-L627
 export const transforms: TypeGenerator["transforms"] = [
-  RelayRelayDirectiveTransform.transform,
-  RelayMaskTransform.transform,
+  RelayDirectiveTransform.transform,
+  MaskTransform.transform,
   ConnectionFieldTransform.transform,
-  RelayMatchTransform.transform,
+  MatchTransform.transform,
   FlattenTransform.transformWithOptions({}),
-  RelayRefetchableFragmentTransform.transform
+  RefetchableFragmentTransform.transform
 ];
